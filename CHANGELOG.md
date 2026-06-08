@@ -5,6 +5,9 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+### Removed
+- **Gemini CLI backend retired** ([#1580](https://github.com/suzuke/agend-terminal/issues/1580), completes [#8](https://github.com/suzuke/agend-terminal/issues/8)). `gemini-cli` sunsets 2026-06-18 (free/Pro/Ultra); its official successor Antigravity CLI (`agy`) has been a supported backend since [#1547](https://github.com/suzuke/agend-terminal/issues/1547). The `Backend::Gemini` variant, its preset/detection patterns, and the 8 gemini state-replay fixtures are removed. **Operator note:** a `gemini` / `gemini-cli` backend named in `fleet.yaml` no longer resolves to a managed backend — it now spawns as a generic `Raw` backend. Switch such entries to `agy`. Removing the last legacy backend also let the legacy detection spine (`compile_for`, `config_for_legacy`, `legacy_initial_state`) be deleted — every backend now routes through its co-located `BackendProfile` (#8 complete).
+
 ### Changed
 
 - **Retention sweeps decoupled; `AGEND_CTRLC_SENTINEL` removed (#1812 env-cleanup)** — the decisions retention sweep now reads its own opt-in flag **`AGEND_RETENTION_DECISIONS_CUTOVER=1`**, separate from the pending-dispatch kill-switch `AGEND_RETENTION_CUTOVER` (which a co-consumer read with the opposite polarity, so "pending-off + decisions-on" was unreachable). **Migration:** the legacy `AGEND_RETENTION_CUTOVER=1` still enables the decisions sweep for now (deprecation window) — prefer the new flag. Separately, the internal Windows-debug aid `AGEND_CTRLC_SENTINEL` (wrote a sentinel file on Ctrl+C) was removed: no operator use, no automated consumer. `AGEND_POINTER_ONLY_INJECT` was reviewed and **kept** (a live inbox-injection feature flag).

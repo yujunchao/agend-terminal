@@ -5,6 +5,9 @@
 
 ## [Unreleased]
 
+### 移除
+- **Gemini CLI backend 退役**（[#1580](https://github.com/suzuke/agend-terminal/issues/1580),完成 [#8](https://github.com/suzuke/agend-terminal/issues/8))。`gemini-cli` 於 2026-06-18 停止服務(免費/Pro/Ultra);其官方後繼者 Antigravity CLI(`agy`)自 [#1547](https://github.com/suzuke/agend-terminal/issues/1547) 起即為支援的 backend。`Backend::Gemini` 變體、其 preset/偵測 patterns、以及 8 個 gemini state-replay fixtures 皆已移除。**操作者注意:** `fleet.yaml` 內指定的 `gemini` / `gemini-cli` 不再解析為受管 backend,改以泛用 `Raw` backend 啟動;請改用 `agy`。移除最後一個 legacy backend 也讓 legacy 偵測骨幹(`compile_for`、`config_for_legacy`、`legacy_initial_state`)得以刪除——每個 backend 現在皆透過其同址的 `BackendProfile` 路由(#8 完成)。
+
 ### Changed
 
 - **retention sweep 解耦;移除 `AGEND_CTRLC_SENTINEL`(#1812 env-cleanup)** — decisions retention sweep 改讀自己的 opt-in 旗標 **`AGEND_RETENTION_DECISIONS_CUTOVER=1`**,與 pending-dispatch kill-switch `AGEND_RETENTION_CUTOVER` 分離(後者的另一消費者以相反極性讀取,導致「pending 關 + decisions 開」無法達成)。**遷移:** 舊的 `AGEND_RETENTION_CUTOVER=1` 暫時仍會啟用 decisions sweep(棄用緩衝期)—— 請改用新旗標。另外移除內部 Windows 除錯輔助 `AGEND_CTRLC_SENTINEL`(Ctrl+C 時寫 sentinel 檔):無 operator 用途、無自動化消費者。`AGEND_POINTER_ONLY_INJECT` 經檢視後**保留**(是 inbox 注入的實際功能旗標)。

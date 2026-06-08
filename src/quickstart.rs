@@ -10,15 +10,14 @@ pub fn run(home: &Path) -> anyhow::Result<()> {
     // Step 1: Detect backends
     let backends = detect_backends();
     if backends.is_empty() {
-        // Sprint 56 Track H4 (#525 item 13): list all five supported
-        // backends, not just three. Pre-Track-H4 the message stopped
-        // at three (Claude / codex / gemini-cli) so operators with a
-        // Kiro or OpenCode preference saw "no supported backends" and
-        // had no install hint pointing them at their tool.
+        // Sprint 56 Track H4 (#525 item 13): list the supported backends so
+        // operators with a Kiro or OpenCode preference get an install hint
+        // instead of a bare "no supported backends". #1580: the Gemini CLI line
+        // was dropped — gemini-cli is retired (sunset 2026-06-18); its successor
+        // Agy (Antigravity CLI) is detected by command but has no npm one-liner.
         println!("  No supported backends found. Install one of:");
         println!("    Claude Code   npm install -g @anthropic-ai/claude-code");
         println!("    codex         npm install -g @openai/codex");
-        println!("    Gemini CLI    npm install -g @google/gemini-cli");
         println!("    Kiro CLI      see https://kiro.dev for installer");
         println!("    OpenCode      see https://opencode.ai for installer");
         println!();
