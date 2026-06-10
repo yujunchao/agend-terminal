@@ -73,8 +73,18 @@ pub(crate) fn flush_all_with<F>(home: &Path, mut injector: F)
 where
     F: FnMut(&str, &str) -> anyhow::Result<()>,
 {
-    // RED stub — implementation lands in the follow-up commit.
-    let _ = (home, &mut injector);
+    let Ok(fleet) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
+        return;
+    };
+    for agent in fleet.instances.keys() {
+        // Cheap idle path: one file-stat per instance when nothing is queued.
+        if crate::notification_queue::pending_count(home, agent) == 0 {
+            continue;
+        }
+        // Shared core applies the SAME draft/busy/typing gating + MAX_DEFER
+        // caps as the TUI flush; failed injects are requeued for next tick.
+        crate::inbox::notify::flush_agent_queue(home, agent, |text| injector(agent, text));
+    }
 }
 
 #[cfg(test)]
