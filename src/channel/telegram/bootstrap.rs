@@ -154,6 +154,150 @@ pub fn init_from_config(
     Some(state)
 }
 
+/// Pure planning for the bootstrap topic-assignment pass
+/// (t-20260610083024814227-0: config-driven General-topic binding).
+///
+/// Returns `(topic_map, general_claimant, to_create)`:
+/// - `topic_map` — instance → topic id for every binding the registry already
+///   carries, INCLUDING the permanent General topic (id 1) when its bound
+///   instance still exists in the fleet. The previous code filtered id 1 out
+///   unconditionally, which evicted any non-"general"-named instance from
+///   General at every boot and fed the 2026-06-10 duplicate-topic cascade.
+/// - `general_claimant` — the instance to bind to General when nobody holds
+///   it: an explicit `topic_id: 1` in fleet.yaml wins (lexicographically
+///   first if several claim, with a warn); the legacy hardcoded instance
+///   NAME "general" stays as a fallback so existing deployments keep their
+///   behavior.
+/// - `to_create` — instances with no binding → track-on-create.
+///
+/// A registry General entry pointing at an instance no longer in the fleet is
+/// stale: it is dropped from the returned map (the caller's registry save
+/// rewrites it away). Unlike ordinary orphans there is no `delete_topic` to
+/// call — Telegram's General topic cannot be deleted (TOPIC_ID_INVALID).
+pub(super) fn plan_topic_assignments(
+    config: &crate::fleet::FleetConfig,
+    reg: &HashMap<i32, String>,
+) -> (HashMap<String, i32>, Option<String>, Vec<String>) {
+    // RED stub — legacy semantics (id-1 bindings invisible, only the literal
+    // name "general" may claim General). Real logic lands in the follow-up
+    // commit; the tests below pin the target behavior.
+    let topic_map: HashMap<String, i32> = reg
+        .iter()
+        .filter(|(tid, name)| **tid != 1 && name.as_str() != FLEET_BINDING_SENTINEL)
+        .map(|(tid, name)| (name.clone(), *tid))
+        .collect();
+    let general_claimant = config
+        .instances
+        .contains_key("general")
+        .then(|| "general".to_string())
+        .filter(|n| !topic_map.contains_key(n.as_str()));
+    let to_create: Vec<String> = config
+        .instances
+        .keys()
+        .filter(|n| {
+            !topic_map.contains_key(n.as_str()) && Some(n.as_str()) != general_claimant.as_deref()
+        })
+        .cloned()
+        .collect();
+    (topic_map, general_claimant, to_create)
+}
+
+#[cfg(test)]
+mod general_topic_plan_tests {
+    use super::*;
+
+    fn cfg(yaml: &str) -> crate::fleet::FleetConfig {
+        serde_yaml_ng::from_str(yaml).expect("test fleet yaml")
+    }
+
+    fn reg(pairs: &[(i32, &str)]) -> HashMap<i32, String> {
+        pairs.iter().map(|(t, n)| (*t, n.to_string())).collect()
+    }
+
+    /// The operator-facing contract: `topic_id: 1` in fleet.yaml binds that
+    /// instance to the permanent General topic — no new topic is created.
+    #[test]
+    fn explicit_topic_id_1_claims_general() {
+        let config = cfg("instances:\n  AgendTerminal:\n    topic_id: 1\n  Other: {}\n");
+        let (_map, claimant, to_create) = plan_topic_assignments(&config, &HashMap::new());
+        assert_eq!(
+            claimant.as_deref(),
+            Some("AgendTerminal"),
+            "explicit topic_id: 1 must claim the General topic"
+        );
+        assert!(
+            !to_create.contains(&"AgendTerminal".to_string()),
+            "the General claimant must NOT get a track-on-create topic"
+        );
+        assert!(to_create.contains(&"Other".to_string()));
+    }
+
+    /// Legacy behavior preserved: an instance literally named "general"
+    /// claims General when nobody claims it explicitly.
+    #[test]
+    fn legacy_general_name_still_claims() {
+        let config = cfg("instances:\n  general: {}\n");
+        let (_map, claimant, _) = plan_topic_assignments(&config, &HashMap::new());
+        assert_eq!(claimant.as_deref(), Some("general"));
+    }
+
+    /// Explicit config beats the legacy name when both are present.
+    #[test]
+    fn explicit_claimant_beats_legacy_name() {
+        let config = cfg("instances:\n  general: {}\n  AgendTerminal:\n    topic_id: 1\n");
+        let (_map, claimant, to_create) = plan_topic_assignments(&config, &HashMap::new());
+        assert_eq!(
+            claimant.as_deref(),
+            Some("AgendTerminal"),
+            "explicit topic_id: 1 must take precedence over the legacy name"
+        );
+        assert!(
+            to_create.contains(&"general".to_string()),
+            "the displaced legacy instance gets an ordinary topic instead"
+        );
+    }
+
+    /// An EXISTING registry binding to General must be honored — the
+    /// pre-fix filter dropped it, evicting the instance every boot (the
+    /// 2026-06-10 cascade).
+    #[test]
+    fn registry_general_binding_survives_for_live_instance() {
+        let config = cfg("instances:\n  AgendTerminal:\n    topic_id: 1\n");
+        let (map, claimant, to_create) = plan_topic_assignments(&config, &reg(&[(1, "AgendTerminal")]));
+        assert_eq!(
+            map.get("AgendTerminal"),
+            Some(&1),
+            "an existing General binding must load into the topic map"
+        );
+        assert_eq!(claimant, None, "already bound — nothing to claim");
+        assert!(to_create.is_empty(), "bound instance must not be recreated");
+    }
+
+    /// A STALE registry General binding (instance gone from the fleet) is
+    /// dropped from the map so a configured claimant can take over —
+    /// without any delete_topic call (General is undeletable on Telegram).
+    #[test]
+    fn stale_general_binding_yields_to_new_claimant() {
+        let config = cfg("instances:\n  AgendTerminal:\n    topic_id: 1\n");
+        let (map, claimant, _) = plan_topic_assignments(&config, &reg(&[(1, "ghost")]));
+        assert!(
+            !map.values().any(|t| *t == 1),
+            "stale General binding must not occupy the topic map"
+        );
+        assert_eq!(claimant.as_deref(), Some("AgendTerminal"));
+    }
+
+    /// Multiple explicit claimants: deterministic winner (lexicographic),
+    /// the rest fall through to track-on-create.
+    #[test]
+    fn multiple_explicit_claimants_first_sorted_wins() {
+        let config = cfg("instances:\n  Zeta:\n    topic_id: 1\n  Alpha:\n    topic_id: 1\n");
+        let (_map, claimant, to_create) = plan_topic_assignments(&config, &HashMap::new());
+        assert_eq!(claimant.as_deref(), Some("Alpha"));
+        assert!(to_create.contains(&"Zeta".to_string()));
+    }
+}
+
 /// Resolve the `fleet_binding` block to a concrete Telegram forum topic id.
 pub(super) fn resolve_fleet_binding(
     bot: &teloxide::Bot,

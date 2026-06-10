@@ -82,6 +82,66 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
     "general".to_string()
 }
 
+#[cfg(test)]
+mod general_topic_routing_tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    fn tmp_home(suffix: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agend-general-route-{}-{}",
+            suffix,
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn state_with_home(home: PathBuf) -> TelegramState {
+        TelegramState::new_for_contract_test(-1, HashMap::new(), home, HashMap::new(), None)
+    }
+
+    /// t-20260610083024814227-0: a message posted in the permanent General
+    /// topic arrives WITHOUT message_thread_id. It must route to whichever
+    /// instance claimed General (registry id 1) — not to a hardcoded
+    /// "general" name that may not exist in the fleet.
+    #[test]
+    fn no_thread_id_routes_to_general_claimant_from_registry() {
+        let home = tmp_home("claimant");
+        std::fs::write(
+            home.join("topics.json"),
+            r#"{"1": "AgendTerminal", "10": "Marketing_Assistant"}"#,
+        )
+        .expect("write registry");
+        let mut state = state_with_home(home.clone());
+        assert_eq!(
+            resolve_topic(&mut state, None),
+            "AgendTerminal",
+            "General-topic inbound must follow the registry's id-1 binding"
+        );
+        // And the lookup is cached like every other topic resolution.
+        assert_eq!(
+            state.topic_to_instance.get(&1).map(String::as_str),
+            Some("AgendTerminal")
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// No claimant registered → legacy fallback name (pre-existing
+    /// deployments with an instance literally named "general").
+    #[test]
+    fn no_thread_id_falls_back_to_legacy_name_when_unclaimed() {
+        let home = tmp_home("legacy");
+        std::fs::write(home.join("topics.json"), r#"{"10": "Marketing_Assistant"}"#)
+            .expect("write registry");
+        let mut state = state_with_home(home.clone());
+        assert_eq!(resolve_topic(&mut state, None), "general");
+        std::fs::remove_dir_all(home).ok();
+    }
+}
+
 /// Sprint 54 silent-drop hotfix: emit the canonical attachment-download
 /// failure WARN with sender + kind context. Extracted so the test suite
 /// can verify the field shape via `tracing_test` without driving the
