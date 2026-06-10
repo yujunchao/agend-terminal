@@ -310,6 +310,7 @@ pub(crate) fn drain_with_stale_threshold(
     }
     let Ok(lock_file) = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&lock_path)
