@@ -275,9 +275,10 @@ fn drain_lock_path(home: &Path, agent_name: &str) -> PathBuf {
 /// Claim-exclusive drain. The TUI flush loop and the daemon's per-tick
 /// `notification_flush` handler run in DIFFERENT processes and may drain the
 /// same agent concurrently, so the whole critical section is serialized by a
-/// per-agent OS file lock (same `fs4` idiom as `.daemon.lock`):
+/// per-agent OS file lock (`store::try_acquire_file_lock` — the #1629
+/// FLOCK_DEPTH chokepoint):
 ///
-/// 1. `try_lock` on `<agent>.drain.lock` — held means a peer flusher is
+/// 1. Try-lock on `<agent>.drain.lock` — held means a peer flusher is
 ///    draining this agent right now; walk away empty (the holder delivers,
 ///    and our caller retries next tick). The lock releases on drop, including
 ///    on crash (the OS releases file locks with the process).
@@ -304,24 +305,17 @@ pub(crate) fn drain_with_stale_threshold(
     agent_name: &str,
     stale_ms: u128,
 ) -> Vec<QueuedNotification> {
-    let lock_path = drain_lock_path(home, agent_name);
-    if let Some(parent) = lock_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let Ok(lock_file) = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
+    // #1629: routed through the store chokepoint so the flock bumps
+    // FLOCK_DEPTH for the self-IPC deadlock guard. Non-blocking on purpose:
+    // `None` (held by a peer flusher) and `Err` (lock file unusable) both walk
+    // away empty — the holder delivers, and our caller retries next tick.
+    // No inject/self-IPC happens while the guard is held: drain only touches
+    // files and returns; injection runs after the guard drops.
+    let Ok(Some(_drain_lock)) =
+        crate::store::try_acquire_file_lock(&drain_lock_path(home, agent_name))
     else {
         return Vec::new();
     };
-    // Explicit trait method (MSRV 1.87 — matches bootstrap's daemon.lock
-    // usage): Err == another flusher holds this agent's drain lock right now.
-    if fs4::FileExt::try_lock(&lock_file).is_err() {
-        return Vec::new();
-    }
     let mut out = Vec::new();
     for leftover in list_draining_files(home, agent_name) {
         if draining_file_is_stale(&leftover, stale_ms) {
@@ -335,7 +329,7 @@ pub(crate) fn drain_with_stale_threshold(
             out.extend(read_drain_file(&claim));
         }
     }
-    // `lock_file` drops here → lock released.
+    // `_drain_lock` drops here → OS lock released + FLOCK_DEPTH decremented.
     out
 }
 
