@@ -78,6 +78,20 @@ pub(super) fn resolve_topic(state: &mut TelegramState, topic_id: Option<i32>) ->
             thread_id = tid,
             "resolve_topic: topic_id not found in memory or topics.json — falling back to \"general\""
         );
+        return "general".to_string();
+    }
+    // No thread id ⇒ posted in the permanent General topic (Telegram sends
+    // General messages without message_thread_id). Route to whichever
+    // instance claimed General — registry id 1 — instead of the historical
+    // hardcoded "general" name (t-20260610083024814227-0).
+    if let Some(name) = state.topic_to_instance.get(&1).cloned() {
+        return name;
+    }
+    let reg = load_topic_registry(&state.home);
+    if let Some(name) = reg.get(&1) {
+        state.topic_to_instance.insert(1, name.clone());
+        state.instance_to_topic.insert(name.clone(), 1);
+        return name.clone();
     }
     "general".to_string()
 }

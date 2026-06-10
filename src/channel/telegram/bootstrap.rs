@@ -69,8 +69,19 @@ pub fn init_from_config(
     let mut reg = load_topic_registry(home);
     let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
     let mut orphan_count = 0;
+    let mut stale_general = false;
     for (tid, inst_name) in reg.clone() {
-        if tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !instance_names.contains(&inst_name) {
+        if inst_name == FLEET_BINDING_SENTINEL || instance_names.contains(&inst_name) {
+            continue;
+        }
+        if tid == 1 {
+            // General can never be deleted on Telegram (TOPIC_ID_INVALID) —
+            // a stale binding is registry-only cleanup, freeing the topic for
+            // a configured claimant (t-20260610083024814227-0).
+            tracing::info!(instance = %inst_name, "stale General-topic binding (instance gone) — dropping registry entry");
+            reg.remove(&tid);
+            stale_general = true;
+        } else {
             tracing::info!(topic_id = tid, instance = %inst_name, "orphaned topic, deleting");
             delete_topic(home, tid);
             orphan_count += 1;
@@ -78,17 +89,19 @@ pub fn init_from_config(
     }
     if orphan_count > 0 {
         reg = load_topic_registry(home);
+        if stale_general {
+            // delete_topic reloads from disk — re-apply the registry-only drop.
+            reg.remove(&1);
+        }
         tracing::info!(count = orphan_count, "cleaned up orphaned topics");
     }
 
     let bot = teloxide::Bot::new(&token);
     let chat_id = teloxide::types::ChatId(*group_id);
 
-    let mut topic_map: HashMap<String, i32> = reg
-        .iter()
-        .filter(|(tid, name)| **tid != 1 && name.as_str() != FLEET_BINDING_SENTINEL)
-        .map(|(tid, name)| (name.clone(), *tid))
-        .collect();
+    // t-20260610083024814227-0: planning extracted to a pure fn so the
+    // General-claim rules are unit-testable (see general_topic_plan_tests).
+    let (mut topic_map, general_claimant, to_create) = plan_topic_assignments(config, &reg);
 
     // Auto-create topics for instances without topic_id.
     //
@@ -112,20 +125,21 @@ pub fn init_from_config(
     // operator intervention via the (γ) `agend-terminal doctor
     // topics` surface (Sprint 60+ candidate: teloxide upgrade
     // evaluation if a future Bot API version exposes enumeration).
-    for name in config.instances.keys() {
-        if topic_map.contains_key(name.as_str()) {
-            continue;
+    if let Some(name) = general_claimant {
+        // Config-driven General binding (explicit `topic_id: 1`, or the
+        // legacy literal name "general"). Outbound already handles id 1 by
+        // omitting message_thread_id; nothing to create on Telegram's side —
+        // the General topic always exists and cannot be deleted.
+        tracing::info!(instance = %name, "binding instance to the permanent General topic (id 1)");
+        topic_map.insert(name.clone(), 1);
+        if let Err(e) = register_topic(home, 1, &name) {
+            tracing::warn!(error = %e, instance = %name, "failed to register General-topic binding");
         }
-        if name == "general" {
-            topic_map.insert("general".to_string(), 1);
-            if let Err(e) = register_topic(home, 1, "general") {
-                tracing::warn!(error = %e, "failed to register general topic");
-            }
-        } else {
-            tracing::info!(instance = %name, "auto-creating topic via track-on-create");
-            if let Some(tid) = create_topic_for_instance(home, name) {
-                topic_map.insert(name.clone(), tid);
-            }
+    }
+    for name in &to_create {
+        tracing::info!(instance = %name, "auto-creating topic via track-on-create");
+        if let Some(tid) = create_topic_for_instance(home, name) {
+            topic_map.insert(name.clone(), tid);
         }
     }
 
@@ -178,19 +192,53 @@ pub(super) fn plan_topic_assignments(
     config: &crate::fleet::FleetConfig,
     reg: &HashMap<i32, String>,
 ) -> (HashMap<String, i32>, Option<String>, Vec<String>) {
-    // RED stub — legacy semantics (id-1 bindings invisible, only the literal
-    // name "general" may claim General). Real logic lands in the follow-up
-    // commit; the tests below pin the target behavior.
+    // Registry bindings load as-is — including General (id 1), but only when
+    // its bound instance still exists in the fleet (a stale General binding
+    // must yield so a configured claimant can take over).
     let topic_map: HashMap<String, i32> = reg
         .iter()
-        .filter(|(tid, name)| **tid != 1 && name.as_str() != FLEET_BINDING_SENTINEL)
+        .filter(|(tid, name)| {
+            name.as_str() != FLEET_BINDING_SENTINEL
+                && (**tid != 1 || config.instances.contains_key(name.as_str()))
+        })
         .map(|(tid, name)| (name.clone(), *tid))
         .collect();
-    let general_claimant = config
-        .instances
-        .contains_key("general")
-        .then(|| "general".to_string())
-        .filter(|n| !topic_map.contains_key(n.as_str()));
+
+    let general_taken = topic_map.values().any(|t| *t == 1);
+    let general_claimant = if general_taken {
+        None
+    } else {
+        // Explicit `topic_id: 1` wins; lexicographic order makes the winner
+        // deterministic across boots (HashMap iteration order is not).
+        let mut explicit: Vec<&String> = config
+            .instances
+            .iter()
+            .filter(|(name, inst)| {
+                inst.topic_id == Some(1) && !topic_map.contains_key(name.as_str())
+            })
+            .map(|(name, _)| name)
+            .collect();
+        explicit.sort();
+        if explicit.len() > 1 {
+            tracing::warn!(
+                claimants = ?explicit,
+                "multiple instances claim the General topic (topic_id: 1) — first (sorted) wins"
+            );
+        }
+        explicit
+            .first()
+            .map(|s| (*s).to_string())
+            // Legacy fallback: an instance literally named "general" keeps
+            // its historical General-topic home when nobody claims it.
+            .or_else(|| {
+                config
+                    .instances
+                    .contains_key("general")
+                    .then(|| "general".to_string())
+                    .filter(|n| !topic_map.contains_key(n.as_str()))
+            })
+    };
+
     let to_create: Vec<String> = config
         .instances
         .keys()
@@ -200,6 +248,54 @@ pub(super) fn plan_topic_assignments(
         .cloned()
         .collect();
     (topic_map, general_claimant, to_create)
+}
+
+/// Resolve the `fleet_binding` block to a concrete Telegram forum topic id.
+pub(super) fn resolve_fleet_binding(
+    bot: &teloxide::Bot,
+    chat_id: teloxide::types::ChatId,
+    home: &Path,
+    reg: &mut HashMap<i32, String>,
+    fleet_binding: &Option<crate::fleet::FleetBindingConfig>,
+) -> Option<i32> {
+    let name = match fleet_binding.as_ref()? {
+        crate::fleet::FleetBindingConfig::Struct(crate::fleet::FleetBindingStruct::Topic {
+            name,
+        }) => name.clone(),
+        crate::fleet::FleetBindingConfig::Shorthand(raw) => {
+            tracing::warn!(
+                shorthand = %raw,
+                "telegram channel.fleet_binding shorthand ignored — Telegram requires \
+                 `{{type: topic, name: ...}}` (shorthand is Discord/Slack only). \
+                 Fleet events will not be mirrored on this channel."
+            );
+            return None;
+        }
+    };
+
+    // Fast path: previously-resolved topic still present in registry.
+    for (tid, inst) in reg.iter() {
+        if inst == FLEET_BINDING_SENTINEL {
+            tracing::info!(topic_id = *tid, %name, "reusing existing fleet_binding topic");
+            return Some(*tid);
+        }
+    }
+
+    // Slow path: create the forum topic once and pin it into the registry.
+    tracing::info!(%name, "creating fleet_binding topic");
+    match block_on_value(async { bot.create_forum_topic(chat_id, &name).await }) {
+        Ok(topic) => {
+            let tid = topic.thread_id.0 .0;
+            tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
+            reg.insert(tid, FLEET_BINDING_SENTINEL.to_string());
+            let _ = save_topic_registry(home, reg);
+            Some(tid)
+        }
+        Err(e) => {
+            tracing::error!(error = %e, %name, "failed to create fleet_binding topic");
+            None
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,7 +359,8 @@ mod general_topic_plan_tests {
     #[test]
     fn registry_general_binding_survives_for_live_instance() {
         let config = cfg("instances:\n  AgendTerminal:\n    topic_id: 1\n");
-        let (map, claimant, to_create) = plan_topic_assignments(&config, &reg(&[(1, "AgendTerminal")]));
+        let (map, claimant, to_create) =
+            plan_topic_assignments(&config, &reg(&[(1, "AgendTerminal")]));
         assert_eq!(
             map.get("AgendTerminal"),
             Some(&1),
@@ -295,53 +392,5 @@ mod general_topic_plan_tests {
         let (_map, claimant, to_create) = plan_topic_assignments(&config, &HashMap::new());
         assert_eq!(claimant.as_deref(), Some("Alpha"));
         assert!(to_create.contains(&"Zeta".to_string()));
-    }
-}
-
-/// Resolve the `fleet_binding` block to a concrete Telegram forum topic id.
-pub(super) fn resolve_fleet_binding(
-    bot: &teloxide::Bot,
-    chat_id: teloxide::types::ChatId,
-    home: &Path,
-    reg: &mut HashMap<i32, String>,
-    fleet_binding: &Option<crate::fleet::FleetBindingConfig>,
-) -> Option<i32> {
-    let name = match fleet_binding.as_ref()? {
-        crate::fleet::FleetBindingConfig::Struct(crate::fleet::FleetBindingStruct::Topic {
-            name,
-        }) => name.clone(),
-        crate::fleet::FleetBindingConfig::Shorthand(raw) => {
-            tracing::warn!(
-                shorthand = %raw,
-                "telegram channel.fleet_binding shorthand ignored — Telegram requires \
-                 `{{type: topic, name: ...}}` (shorthand is Discord/Slack only). \
-                 Fleet events will not be mirrored on this channel."
-            );
-            return None;
-        }
-    };
-
-    // Fast path: previously-resolved topic still present in registry.
-    for (tid, inst) in reg.iter() {
-        if inst == FLEET_BINDING_SENTINEL {
-            tracing::info!(topic_id = *tid, %name, "reusing existing fleet_binding topic");
-            return Some(*tid);
-        }
-    }
-
-    // Slow path: create the forum topic once and pin it into the registry.
-    tracing::info!(%name, "creating fleet_binding topic");
-    match block_on_value(async { bot.create_forum_topic(chat_id, &name).await }) {
-        Ok(topic) => {
-            let tid = topic.thread_id.0 .0;
-            tracing::info!(topic_id = tid, %name, "created fleet_binding topic");
-            reg.insert(tid, FLEET_BINDING_SENTINEL.to_string());
-            let _ = save_topic_registry(home, reg);
-            Some(tid)
-        }
-        Err(e) => {
-            tracing::error!(error = %e, %name, "failed to create fleet_binding topic");
-            None
-        }
     }
 }
