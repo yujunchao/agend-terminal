@@ -509,4 +509,35 @@ mod tests {
         assert!(drain_one(&home, "a").is_none(), "empty after draining all");
         std::fs::remove_dir_all(home).ok();
     }
+
+    /// Concurrent-claim contract: a FRESH foreign draining file belongs to a
+    /// LIVE concurrent drain (e.g. the TUI flush mid-drain while the daemon's
+    /// per-tick flush scans the same agent). Re-reading it double-delivers
+    /// every line it contains. `drain` must claim work ONLY by atomically
+    /// renaming the live queue file; a fresh foreign draining file is left
+    /// untouched (only STALE ones — a crashed drainer's leftovers — are
+    /// recovered).
+    #[test]
+    fn drain_does_not_steal_fresh_foreign_draining_file() {
+        let home = tmp_home("foreign_draining");
+        std::fs::remove_dir_all(&home).ok();
+        std::fs::create_dir_all(&home).ok();
+        enqueue(&home, "a", "claimed-by-peer").expect("enqueue");
+        // Simulate a concurrent drainer that has JUST claimed the queue
+        // (renamed it to its draining file and is about to inject).
+        std::fs::rename(queue_path(&home, "a"), draining_path(&home, "a"))
+            .expect("simulate peer claim");
+        let got = drain(&home, "a");
+        assert!(
+            got.is_empty(),
+            "a fresh foreign draining file must NOT be re-read — that \
+             double-delivers the peer's claimed items: {got:?}"
+        );
+        assert_eq!(
+            pending_count(&home, "a"),
+            1,
+            "the peer's claimed item still counts as pending (it owns delivery)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
 }
