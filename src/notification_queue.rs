@@ -252,25 +252,48 @@ fn list_draining_files(home: &Path, agent_name: &str) -> Vec<PathBuf> {
 }
 
 fn draining_file_is_stale(path: &Path, stale_ms: u128) -> bool {
+    // Metadata anomalies (file vanished mid-scan, future mtime after a clock
+    // step) are treated as STALE: this check only runs under the per-agent
+    // drain lock, where no live peer can own the file — recovering it is
+    // safe, while skipping would strand it forever and permanently inflate
+    // `pending_count` (reviewer challenge 3, PR #1).
     std::fs::metadata(path)
         .and_then(|m| m.modified())
         .ok()
         .and_then(|t| t.elapsed().ok())
         .map(|age| age.as_millis() >= stale_ms)
-        .unwrap_or(false)
+        .unwrap_or(true)
 }
 
-/// Claim-atomic drain. The TUI flush loop and the daemon's per-tick
+/// Per-agent drain mutex file. Sibling of the queue file; the name shares the
+/// `<agent>.` prefix but NOT the `<agent>.draining` prefix, so neither
+/// `list_draining_files` nor `pending_count` ever picks it up as queue content.
+fn drain_lock_path(home: &Path, agent_name: &str) -> PathBuf {
+    queue_path(home, agent_name).with_extension("drain.lock")
+}
+
+/// Claim-exclusive drain. The TUI flush loop and the daemon's per-tick
 /// `notification_flush` handler run in DIFFERENT processes and may drain the
-/// same agent concurrently — the atomic rename is the claim, so each queued
-/// line is delivered by exactly one flusher:
+/// same agent concurrently, so the whole critical section is serialized by a
+/// per-agent OS file lock (same `fs4` idiom as `.daemon.lock`):
 ///
-/// 1. A FRESH foreign draining file is a live peer's in-flight claim — leave
-///    it alone (re-reading it double-delivers). A STALE one (≥30s) belongs to
-///    a crashed drainer; fold its lines into this drain.
-/// 2. The live queue is claimed by renaming it to a unique per-process claim
-///    file. The loser of a concurrent rename race gets `Err` and walks away —
-///    the winner owns delivery.
+/// 1. `try_lock` on `<agent>.drain.lock` — held means a peer flusher is
+///    draining this agent right now; walk away empty (the holder delivers,
+///    and our caller retries next tick). The lock releases on drop, including
+///    on crash (the OS releases file locks with the process).
+/// 2. Inside the lock: a FRESH foreign draining file is a recently-crashed
+///    peer's in-flight claim — leave it alone until the STALE window (≥30s)
+///    passes, then crash-recover its lines. (A LIVE peer is excluded by the
+///    lock, so any foreign claim file seen here belongs to a dead drainer.)
+/// 3. The live queue is claimed by renaming it to a unique per-process claim
+///    file, then read + removed.
+///
+/// Plain rename-arbitration without the lock double-delivered under CI
+/// concurrency (windows-latest, run 27248027241): two racing renames of the
+/// same source can interleave (open-source → set-rename-info), re-renaming
+/// the winner's just-claimed file so BOTH drainers read the same lines. The
+/// OS lock makes single-drainer-per-agent a structural invariant instead of
+/// a rename race.
 pub fn drain(home: &Path, agent_name: &str) -> Vec<QueuedNotification> {
     drain_with_stale_threshold(home, agent_name, STALE_DRAINING_MS)
 }
@@ -281,6 +304,23 @@ pub(crate) fn drain_with_stale_threshold(
     agent_name: &str,
     stale_ms: u128,
 ) -> Vec<QueuedNotification> {
+    let lock_path = drain_lock_path(home, agent_name);
+    if let Some(parent) = lock_path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let Ok(lock_file) = OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(&lock_path)
+    else {
+        return Vec::new();
+    };
+    // Explicit trait method (MSRV 1.87 — matches bootstrap's daemon.lock
+    // usage): Err == another flusher holds this agent's drain lock right now.
+    if fs4::FileExt::try_lock(&lock_file).is_err() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for leftover in list_draining_files(home, agent_name) {
         if draining_file_is_stale(&leftover, stale_ms) {
@@ -294,6 +334,7 @@ pub(crate) fn drain_with_stale_threshold(
             out.extend(read_drain_file(&claim));
         }
     }
+    // `lock_file` drops here → lock released.
     out
 }
 
@@ -629,10 +670,27 @@ mod tests {
         std::fs::remove_dir_all(home).ok();
     }
 
-    /// §3.9 concurrent-state harness: claim-atomicity under racing drainers.
-    /// N threads drain the same agent concurrently; every enqueued line must
-    /// be delivered EXACTLY once across all threads (the rename claim makes
-    /// the winner the sole owner — no loss, no double-delivery).
+    /// Reviewer challenge 3 (PR #1): a metadata anomaly (vanished file /
+    /// future mtime after a clock step) must read as STALE — skipping would
+    /// strand the leftover forever and permanently inflate pending_count.
+    /// Safe because the check only runs under the per-agent drain lock.
+    #[test]
+    fn stale_check_treats_metadata_anomaly_as_stale() {
+        let missing = std::env::temp_dir()
+            .join("agend-notification-queue-anomaly")
+            .join("never-created.draining");
+        assert!(
+            draining_file_is_stale(&missing, 30_000),
+            "unreadable metadata must classify as stale (recoverable), not strand"
+        );
+    }
+
+    /// §3.9 concurrent-state harness: exactly-once delivery under racing
+    /// drainers. N threads drain the same agent concurrently; every enqueued
+    /// line must be delivered EXACTLY once across all threads. Serialized by
+    /// the per-agent OS drain lock — plain rename arbitration double-delivered
+    /// on Windows (PR #1 CI run 27248027241; both racing renames of one source
+    /// can succeed because handles survive renames).
     #[test]
     fn concurrent_drains_deliver_exactly_once() {
         let home = tmp_home("concurrent_drain");

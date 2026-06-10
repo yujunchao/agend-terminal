@@ -77,7 +77,7 @@ where
         return;
     };
     for agent in fleet.instances.keys() {
-        // Cheap idle path: one file-stat per instance when nothing is queued.
+        // Idle fast path: a read_dir + line count of any existing queue files.
         if crate::notification_queue::pending_count(home, agent) == 0 {
             continue;
         }

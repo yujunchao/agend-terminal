@@ -599,8 +599,9 @@ pub(crate) fn build_default_handlers(
         // #1513 busy-gate defers notifications into the queue whose only other
         // flusher is the TUI loop; headless `run_core` (`start --foreground`)
         // has no TUI, so without this handler deferred operator messages
-        // strand forever (7 stranded Telegram messages, 2026-06-10). Cheap
-        // when idle: one pending_count file-stat per fleet instance.
+        // strand forever (7 stranded Telegram messages, 2026-06-10). Idle
+        // cost per instance: one read_dir of notification-queue/ plus a line
+        // count of any existing queue files — trivial at fleet sizes.
         Box::new(per_tick::NotificationFlushHandler::new(1)),
         Box::new(per_tick::LogRotationHandler::new(360)),
         Box::new(per_tick::ThreadDumpHandler::new()),
