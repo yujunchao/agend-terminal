@@ -127,6 +127,38 @@ where
     f(&mut g);
 }
 
+/// Arm the router-layer reply attribution for a channel-originated turn.
+///
+/// Sets `reply_to_channel` (+ a fresh monotonic `reply_to_input_id`) so the
+/// router's PTY-mirror (`daemon::router::try_dispatch_mirror`) will deliver the
+/// agent's **direct assistant text** back to the originating channel even when
+/// the agent never calls the `reply` MCP tool.
+///
+/// Historically this state was set ONLY on the inbox-drain path
+/// (`inbox::storage::drain` → channel message newly read). But two Telegram
+/// inbound paths bypass the inbox entirely and so never armed it:
+///   - short messages (<200 chars, no attachments) → PTY-inject only;
+///   - the raw-keystroke path (`agent_wants_raw_keystrokes`) → raw inject +
+///     early return.
+/// For those turns the operator only saw the response in the CLI, never in
+/// Telegram. Calling this helper on those paths closes the gap by reusing the
+/// exact same mirror machinery (no new delivery code path).
+///
+/// Resets `mirror_dispatched_for_turn` and `mirror_skip_until_next_turn` so a
+/// new turn starts clean. The `reply` tool sets `mirror_skip_until_next_turn`
+/// later in the same turn if the agent does call it, which still suppresses the
+/// mirror — so this never double-delivers.
+pub fn arm_reply_to_channel(name: &str, channel_name: &str) {
+    crate::sync_audit::assert_lock_tier(3, "heartbeat_pair");
+    update_with(name, |p| {
+        p.reply_to_channel = Some(channel_name.to_string());
+        p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
+        p.reply_to_set_at_ms = now_ms() as i64;
+        p.mirror_dispatched_for_turn = false;
+        p.mirror_skip_until_next_turn = false;
+    });
+}
+
 /// Current epoch ms — convenience for callers updating `heartbeat_at_ms`.
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -374,6 +406,49 @@ mod tests {
             .zip(pair.last_mirror_event_id)
             .is_some_and(|(input, last)| input <= last);
         assert!(blocked, "same input_id must be blocked");
+    }
+
+    // ── Telegram direct-text mirror gap — arm_reply_to_channel ───────
+    //
+    // Root cause: reply_to_channel was set ONLY on the inbox-drain path,
+    // so Telegram inbound turns that bypass the inbox (short PTY-inject
+    // and raw-keystroke) never armed the router mirror → the agent's
+    // direct text response never reached Telegram. arm_reply_to_channel
+    // is the shared set-site those paths now call.
+
+    #[test]
+    fn arm_reply_to_channel_sets_channel_and_bumps_input_id() {
+        let name = "test-arm-reply-bumps";
+        // First arm: input_id goes 0 → 1.
+        arm_reply_to_channel(name, "telegram");
+        let snap = snapshot_for(name);
+        assert_eq!(snap.reply_to_channel.as_deref(), Some("telegram"));
+        assert_eq!(snap.reply_to_input_id, Some(1));
+        assert!(snap.reply_to_set_at_ms > 0, "set_at_ms must be stamped");
+        // Second arm (next turn): monotonic bump 1 → 2.
+        arm_reply_to_channel(name, "telegram");
+        let snap2 = snapshot_for(name);
+        assert_eq!(snap2.reply_to_input_id, Some(2));
+    }
+
+    #[test]
+    fn arm_reply_to_channel_resets_mirror_flags_for_new_turn() {
+        let name = "test-arm-reply-resets-flags";
+        // Simulate a prior dispatched/skipped turn.
+        update_with(name, |p| {
+            p.mirror_dispatched_for_turn = true;
+            p.mirror_skip_until_next_turn = true;
+        });
+        arm_reply_to_channel(name, "telegram");
+        let snap = snapshot_for(name);
+        assert!(
+            !snap.mirror_dispatched_for_turn,
+            "new turn must clear dispatched flag so the mirror can fire"
+        );
+        assert!(
+            !snap.mirror_skip_until_next_turn,
+            "new turn must clear skip flag (reply tool re-sets it within the turn)"
+        );
     }
 
     #[test]
