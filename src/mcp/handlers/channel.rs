@@ -79,9 +79,31 @@ pub(super) fn handle_reply(home: &Path, args: &Value, instance_name: &str) -> Va
         None => match crate::channel::active_channel() {
             Some(ch) => ch,
             None => {
-                // #1665 Gap D: no channel to reply on — record the send-failure.
-                crate::reply_ledger::record_reply_outcome(instance_name, false);
-                return json!({"error": "no active channel", "code": "no_active_channel"});
+                // Reply-topic fallback: neither the per-turn attribution
+                // (`reply_to_channel`) nor the `active_channel()` singleton
+                // resolved a channel — this happens when the turn was not
+                // attributed to a channel (e.g. a TUI-direct turn, or an
+                // inbound message that was routed as raw keystrokes without
+                // establishing a Telegram binding). Previously this returned a
+                // bare `no_active_channel` error and the reply vanished
+                // (operator saw nothing on Telegram, only the CLI). Instead,
+                // send the reply directly to this agent's own configured
+                // Telegram topic via the creds-based path (no `active_channel`
+                // needed), so an operator reply still lands on Telegram.
+                match crate::channel::telegram::try_telegram_reply(instance_name, &text) {
+                    Ok((msg_id, _chat_id)) => {
+                        crate::reply_ledger::record_reply_outcome(instance_name, true);
+                        return json!({"message_id": msg_id, "fallback": "agent_topic"});
+                    }
+                    Err(e) => {
+                        // #1665 Gap D: no channel + topic fallback failed — send-failure.
+                        crate::reply_ledger::record_reply_outcome(instance_name, false);
+                        return json!({
+                            "error": format!("no active channel; topic fallback failed: {e}"),
+                            "code": "no_active_channel"
+                        });
+                    }
+                }
             }
         },
     };
