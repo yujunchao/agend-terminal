@@ -384,6 +384,11 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     // the CLI's prompt parser. In every other state, preserve the existing
     // inbox semantics so agent-authored message handling keeps working.
     if agent_wants_raw_keystrokes(registry.as_ref(), &instance_name) {
+        // Arm router-mirror attribution so the agent's direct text reply still
+        // reaches Telegram even though this raw-inject path bypasses the inbox
+        // (which is the only other place reply_to_channel is set). Without this
+        // the operator only sees the response in the CLI.
+        crate::daemon::heartbeat_pair::arm_reply_to_channel(&instance_name, "telegram");
         let payload = format!("{text}\n");
         match crate::api::call(
             &home,
@@ -497,6 +502,12 @@ async fn handle_message(state: &Arc<Mutex<TelegramState>>, msg: &Message) {
     let pointer_only = inbox::notify::pointer_only_inject();
 
     if is_short && !pointer_only {
+        // Arm router-mirror attribution so a direct (non-`reply`-tool) text
+        // response reaches Telegram. This PTY-inject path never enqueues to the
+        // inbox, so the inbox-drain set-site (the only other place
+        // reply_to_channel is set) never fires for short messages. The long
+        // branch below goes through inbox::enqueue and is armed on drain.
+        crate::daemon::heartbeat_pair::arm_reply_to_channel(&instance_name, "telegram");
         inbox::notify_agent_with_attachments(
             &home,
             &instance_name,
@@ -719,6 +730,80 @@ mod tests {
         assert!(
             logs_contain("12345"),
             "WARN must include sender_id (Sprint 54 enrichment)"
+        );
+    }
+
+    // ── Telegram direct-text mirror gap (router PTY-mirror) ──────────
+    //
+    // Root cause: the router mirror (daemon::router::try_dispatch_mirror)
+    // only fires when reply_to_channel.is_some(), and that flag was set
+    // ONLY on the inbox-drain path. Two Telegram inbound paths bypass the
+    // inbox and so never armed it:
+    //   1. short messages (<200 chars, no attachments) → PTY-inject only
+    //   2. raw-keystroke path (agent_wants_raw_keystrokes) → raw inject +
+    //      early return.
+    // Both now call arm_reply_to_channel(.., "telegram"). These tests pin
+    // the source-level invariant so a refactor can't silently re-open the
+    // gap (regression-proof anchor: removing either call fails here).
+
+    #[test]
+    fn raw_keystroke_path_arms_reply_to_channel() {
+        // Slice the production raw-keystroke branch: from its `if` guard up to
+        // the inbound-message-ID persistence comment that follows the branch.
+        // Robust to CRLF/LF and exact indentation.
+        let src = include_str!("inbound.rs");
+        let guard = src
+            .find("if agent_wants_raw_keystrokes(registry.as_ref(), &instance_name) {")
+            .expect("raw-keystroke branch must exist");
+        let branch_end = src[guard..]
+            .find("// Persist the inbound message ID")
+            .map(|i| i + guard)
+            .expect("raw-keystroke branch is followed by the pickup-id persist block");
+        let branch = &src[guard..branch_end];
+        assert!(
+            branch.contains("arm_reply_to_channel(&instance_name, \"telegram\")"),
+            "raw-keystroke path must arm reply_to_channel before its early return, \
+             else the agent's direct text never mirrors to Telegram"
+        );
+        // Must precede the raw inject so attribution is set for the whole turn.
+        let arm_idx = branch.find("arm_reply_to_channel").expect("arm call present");
+        let inject_idx = branch
+            .find("crate::api::method::INJECT")
+            .expect("raw inject present");
+        assert!(
+            arm_idx < inject_idx,
+            "must arm reply_to_channel before raw-injecting the operator text"
+        );
+    }
+
+    #[test]
+    fn short_message_path_arms_reply_to_channel() {
+        let src = include_str!("inbound.rs");
+        let branch_start = src
+            .find("if is_short && !pointer_only {")
+            .expect("short-message branch must exist");
+        // The branch ends at the `} else {` that opens the long path. Match on
+        // the substring without leading whitespace so CRLF/LF can't break it.
+        let else_at = src[branch_start..]
+            .find("} else {")
+            .map(|i| i + branch_start)
+            .expect("short-message branch must have an else");
+        let branch = &src[branch_start..else_at];
+        assert!(
+            branch.contains("arm_reply_to_channel(&instance_name, \"telegram\")"),
+            "short-message PTY-inject path must arm reply_to_channel — it bypasses \
+             the inbox so the drain set-site never fires for it"
+        );
+        // The arm must come before the notify (set attribution first).
+        let arm_idx = branch
+            .find("arm_reply_to_channel")
+            .expect("arm call present");
+        let notify_idx = branch
+            .find("notify_agent_with_attachments")
+            .expect("notify call present");
+        assert!(
+            arm_idx < notify_idx,
+            "must arm reply_to_channel before notifying the agent"
         );
     }
 

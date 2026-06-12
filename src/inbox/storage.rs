@@ -426,13 +426,7 @@ pub fn drain(home: &Path, name: &str) -> Vec<InboxMessage> {
             crate::channel::ChannelKind::Telegram => "telegram",
             crate::channel::ChannelKind::Discord => "discord",
         };
-        crate::daemon::heartbeat_pair::update_with(name, |p| {
-            p.reply_to_channel = Some(channel_name.to_string());
-            p.reply_to_input_id = Some(p.reply_to_input_id.unwrap_or(0) + 1);
-            p.reply_to_set_at_ms = crate::daemon::heartbeat_pair::now_ms() as i64;
-            p.mirror_dispatched_for_turn = false;
-            p.mirror_skip_until_next_turn = false;
-        });
+        crate::daemon::heartbeat_pair::arm_reply_to_channel(name, channel_name);
         // #1665 reply-ledger: arm the delivery-closure audit for this user
         // channel message. `m.channel.is_some()` above is exactly the
         // "[user:… via channel] inbound" eligibility gate. Arming overwrites
