@@ -163,6 +163,51 @@ pub struct FleetConfig {
     pub(crate) home: Option<PathBuf>,
 }
 
+/// An entry in a channel's `user_allowlist`. **Channel-agnostic by design** —
+/// used by Telegram today, and intended for any future channel adapter
+/// (Discord, Slack, …): when their inbound handlers land they should give their
+/// `user_allowlist` this same `Option<Vec<AllowlistEntry>>` type and resolve the
+/// sender name the same way (see `TelegramState::username_for` +
+/// `NotifySource::Channel`, which already renders `user:NAME via {channel}` for
+/// any `ChannelKind`).
+///
+/// Accepts either a bare numeric user id (legacy: `- 12345`) or a `{ id, name }`
+/// map that also records a display name. The name is surfaced as
+/// `[user:NAME via <channel>]` in agent inboxes when the sender has no public
+/// platform username (so the operator no longer shows up as `unknown`).
+/// Backward compatible via `#[serde(untagged)]` — old bare-id lists still parse.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum AllowlistEntry {
+    /// Bare Telegram user id (legacy shape).
+    Id(i64),
+    /// `{ id: 12345, name: "Alice" }` — id plus display name.
+    Named { id: i64, name: String },
+}
+
+impl AllowlistEntry {
+    /// The Telegram user id, regardless of shape.
+    pub fn id(&self) -> i64 {
+        match self {
+            Self::Id(id) | Self::Named { id, .. } => *id,
+        }
+    }
+
+    /// The configured display name, if this entry carries one.
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Self::Named { name, .. } => Some(name.as_str()),
+            Self::Id(_) => None,
+        }
+    }
+}
+
+impl From<i64> for AllowlistEntry {
+    fn from(id: i64) -> Self {
+        Self::Id(id)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum ChannelConfig {
@@ -187,8 +232,13 @@ pub enum ChannelConfig {
         ///   down an environment without removing the channel config.
         /// - `Some([...])`: only those user IDs are accepted; others are
         ///   dropped with a warn log.
+        ///
+        /// Each entry is either a bare id (`- 12345`) or `{ id, name }` — see
+        /// [`AllowlistEntry`]. A configured `name` is shown as the sender in
+        /// agent inboxes (`[user:NAME via telegram]`) when the Telegram account
+        /// has no public @username.
         #[serde(default)]
-        user_allowlist: Option<Vec<i64>>,
+        user_allowlist: Option<Vec<AllowlistEntry>>,
         /// Optional fleet-activity binding — where cross-instance
         /// `FleetEvent`s (delegate / report / decision / broadcast) are
         /// mirrored as one-liner log rows. Omitted = no fleet sink for
