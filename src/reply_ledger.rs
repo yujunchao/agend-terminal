@@ -561,8 +561,15 @@ pub fn notify_operator_last_resort(
         |kind, agent, text| {
             crate::channel::lookup_channel_by_name(kind)
                 .map(|ch| {
-                    ch.send_from_agent(agent, crate::channel::AgentOutboundOp::Reply { text })
-                        .is_ok()
+                    ch.send_from_agent(
+                        agent,
+                        crate::channel::AgentOutboundOp::Reply {
+                            text,
+                            task_id: None,
+                            correlation_id: None,
+                        },
+                    )
+                    .is_ok()
                 })
                 .unwrap_or(false)
         },
