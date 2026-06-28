@@ -681,7 +681,7 @@ impl crate::channel::Channel for DiscordChannel {
 
         // Step 2: dispatch.
         match op {
-            crate::channel::AgentOutboundOp::Reply { text } => {
+            crate::channel::AgentOutboundOp::Reply { text, .. } => {
                 let cid = self.state.lock().instance_to_channel.get(agent).copied();
                 let cid = cid.ok_or_else(|| {
                     ChannelError::Other(anyhow::anyhow!("no discord binding for '{agent}'"))
@@ -1026,7 +1026,11 @@ mod tests {
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "unknown-agent",
-            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+            crate::channel::AgentOutboundOp::Reply {
+                text: "hi".into(),
+                task_id: None,
+                correlation_id: None,
+            },
         );
         let err = result.expect_err("unbound instance must error");
         let err_msg = format!("{err}");
@@ -1044,7 +1048,11 @@ mod tests {
         let result = crate::channel::Channel::send_from_agent(
             &ch,
             "any-agent",
-            crate::channel::AgentOutboundOp::Reply { text: "hi".into() },
+            crate::channel::AgentOutboundOp::Reply {
+                text: "hi".into(),
+                task_id: None,
+                correlation_id: None,
+            },
         );
         let err = result.expect_err("unauthorized channel must reject");
         let err_msg = format!("{err}");

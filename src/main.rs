@@ -74,6 +74,7 @@ pub mod runtime_config;
 mod schedules;
 mod scm;
 mod screenshot;
+mod sent_ledger;
 mod service;
 mod shared_async;
 mod skills;

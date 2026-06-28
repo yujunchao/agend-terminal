@@ -148,7 +148,14 @@ impl ProgressMirrorHandler {
         // Relay to the ORIGIN channel by name — never a broadcast. A missing /
         // failed channel drops silently (best-effort visibility).
         if let Some(ch) = crate::channel::lookup_channel_by_name(&channel) {
-            let _ = ch.send_from_agent(name, crate::channel::AgentOutboundOp::Reply { text });
+            let _ = ch.send_from_agent(
+                name,
+                crate::channel::AgentOutboundOp::Reply {
+                    text,
+                    task_id: None,
+                    correlation_id: None,
+                },
+            );
         }
     }
 }

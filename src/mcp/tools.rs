@@ -28,7 +28,9 @@ pub(crate) fn def_reply() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "message": {"type": "string", "description": "The reply text to send to the user."},
             "default_action": {"type": "string", "description": "Action to auto-execute on timeout when the operator doesn't reply within `timeout_secs`. e.g. 'proceed-with-lean' / 'abort'. Pair with `timeout_secs` (Sprint 59 Wave 1 PR-4)."},
-            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."}
+            "timeout_secs": {"type": "integer", "description": "Seconds to wait for an operator response before firing `default_action`. Required when `default_action` is set; ignored otherwise (Sprint 59 Wave 1 PR-4)."},
+            "task_id": {"type": "string", "description": "Optional task-board id ('t-...') this reply relates to. Recorded in the sent-message ledger so a later operator quote-reply (reply-to) to this message can be correlated back to its task. Omit for ordinary interactive replies with no task context."},
+            "correlation_id": {"type": "string", "description": "Optional correlation id for this reply, recorded alongside task_id in the sent-message ledger for reply-to correlation. Omit when not applicable."}
         }, "required": ["message"]}})
 }
 
