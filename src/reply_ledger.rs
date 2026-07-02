@@ -287,7 +287,7 @@ pub fn arm(
 /// an inbound channel message, in one call — independent of delivery path.
 ///
 /// #2293 progress-mirror fix: the mirror's active-turn gate reads `reply_to_channel`
-/// + `pending_user_turn`. The inbox-drain path (`inbox::storage`) sets both when a
+/// and `pending_user_turn`. The inbox-drain path (`inbox::storage`) sets both when a
 /// channel-tagged message is drained, but a SHORT operator message takes the
 /// PTY-inject path (`channel::telegram::inbound`) and never drains — so without
 /// arming there too, the gate's two fields stay `None`/absent and the mirror never
