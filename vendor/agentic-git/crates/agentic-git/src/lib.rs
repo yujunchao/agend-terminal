@@ -337,20 +337,26 @@ fn shim_main() {
     // repo (separate object store — e.g. a test scratch repo) should operate on
     // THAT repo, not be redirected into the worktree. Post-process the classify
     // result so the (unchanged, unit-tested) `classify` stays cwd-agnostic.
-    let action = apply_nonrepo_read_passthrough(
-        apply_foreign_repo_passthrough(
-            classify_argv(
-                &args,
-                &binding,
-                parent_is_gh,
-                canonical_cwd,
-                is_agent_caller,
-            ),
-            subcommand,
-            norm_args,
-            cwd_is_foreign_repo(&binding),
-        ),
-        subcommand,
+    // #3379: `apply_foreign_repo_passthrough` above rescues an ENUMERATED set of
+    // subcommands from the foreign-cwd redirect; `classify`'s `_` default arm
+    // hands `ChdirPass` to a bound agent for everything it has no policy for. The
+    // difference (checkout/switch/clean/gc/restore --staged/update-ref/…) was
+    // still being aimed at the bound worktree from a foreign object store — a
+    // measured `git checkout -b X` in an unrelated %TEMP% repo moved the bound
+    // worktree's HEAD and the agent's next commit landed on the wrong branch,
+    // with nothing failing anywhere. The seatbelt existed and worked; the
+    // violators just weren't in its set. So this adds no second list — it states
+    // the condition: once cwd is a different object store, `ChdirPass`'s premise
+    // is gone. BARE form only (see `apply_foreign_bare_catchall`): with a leading
+    // `-C`/`--git-dir`/`--work-tree` the cwd is not where git would act, so that
+    // path keeps its existing policy untouched (the #2950 precedent).
+    let action = resolve_action(
+        &args,
+        &binding,
+        parent_is_gh,
+        canonical_cwd,
+        is_agent_caller,
+        cwd_is_foreign_repo(&binding),
         cwd_is_nonrepo(),
     );
 

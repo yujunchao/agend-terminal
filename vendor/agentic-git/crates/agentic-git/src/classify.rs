@@ -492,6 +492,146 @@ pub(crate) fn effective_cwd_through_globals(args: &[String], sub_idx: usize) -> 
 /// preserved. Non-mutating commands and arg lists without a leading override are
 /// returned unchanged. Also closes the same `-C` blind spot in the pre-existing
 /// canonical protection.
+/// The leading-global tokens that RETARGET git at another directory, in their
+/// separated-value form (`-C <path>`) — the option and its value are two tokens.
+///
+/// #3379: extracted so `strip_target_overrides` (which DROPS these) and
+/// `has_leading_target_override` (which DETECTS them) read the SAME set. A
+/// hand-copied second list here would be a rule living in one function while
+/// another that needs it keeps its own copy — the two would drift silently,
+/// and nothing would turn red when they did.
+pub(crate) fn is_separated_target_override(tok: &str) -> bool {
+    tok == "-C" || tok == "--git-dir" || tok == "--work-tree"
+}
+
+/// Same set as [`is_separated_target_override`], in the glued / `=` forms
+/// (`-C<path>`, `--git-dir=<path>`) — a single token carrying its own value.
+pub(crate) fn is_glued_target_override(tok: &str) -> bool {
+    tok.starts_with("-C") || tok.starts_with("--git-dir=") || tok.starts_with("--work-tree=")
+}
+
+/// #3379: does the caller aim git at a directory OTHER than its own cwd, via a
+/// leading `-C` / `--git-dir` / `--work-tree`? Scans ONLY the global region
+/// `[0, sub_idx)` — a POST-subcommand `-C` is not a target override (`git commit
+/// -C <commit>` is reuse-message), exactly as `strip_target_overrides` treats it.
+///
+/// This is the `bare_form` predicate for [`apply_foreign_bare_catchall`]: the
+/// cwd-based foreign check is only a truthful account of where git will act when
+/// no such override is present.
+pub(crate) fn has_leading_target_override(args: &[String], sub_idx: usize) -> bool {
+    let end = sub_idx.min(args.len());
+    args[..end]
+        .iter()
+        .any(|a| is_separated_target_override(a) || is_glued_target_override(a))
+}
+
+/// #3379: the foreign-cwd catch-all for the BARE (cwd-targeted) form.
+///
+/// # Why this exists on top of `apply_foreign_repo_passthrough`
+///
+/// That function passes through an ENUMERATED set: `is_mutating_local` ∪
+/// ref-naming `branch`/`tag` ∪ `sparse-checkout`. But `classify`'s `_` arm returns
+/// `ChdirPass(worktree)` for a bound agent on **every** subcommand it has no
+/// explicit policy for. The difference between those two sets was being
+/// redirected into the bound worktree even though the caller's cwd is a
+/// DIFFERENT object store — silently acting on someone else's branch:
+///
+/// - `checkout` / `switch` — measured: a `git checkout -b X` in an unrelated
+///   `%TEMP%` repo moved the bound worktree's HEAD to `X`, and the agent's next
+///   commit landed on `X`. Nothing failed; the branch name is one bracketed
+///   token in `git commit`'s output.
+/// - `clean` — `git clean -fdx` in a foreign repo would wipe the bound
+///   worktree. Same path, strictly worse (unrecoverable, and no output to
+///   notice it in).
+/// - `restore --staged`, `update-ref`, `symbolic-ref <n> <ref>`, and every
+///   unknown-to-`classify` subcommand (`gc`, `fsck`, `notes`, `bisect`, …).
+///
+/// The seatbelt existed and worked; the violators were simply not in its set.
+/// So this does NOT add another enumerated list — enumerating is what failed.
+/// It states the correct condition instead: **once the caller has cd'd into a
+/// different object store, the premise of `ChdirPass` is gone.**
+///
+/// # What it deliberately does NOT change
+///
+/// - **`bare_form` only.** With a leading `-C` / `--git-dir` / `--work-tree`,
+///   the cwd is not where git would act, and `Passthrough` would let that
+///   override carry the write to any target — canonical included. #2950 already
+///   ruled that only the cwd-targeted form is a policy path; this follows that
+///   precedent rather than inventing a second rule.
+/// - **`push` is untouched.** It classifies to `CleanupAndChdirPushPass`, not
+///   `ChdirPass`, so every protected-ref / force-lease / trust-root guard on the
+///   push path is outside this function's reach by construction.
+/// - **`Deny` is untouched** (foreign submodule writes still deny).
+/// - **A non-foreign cwd is untouched** — a bound agent working in its own
+///   worktree keeps being routed there, byte-identically.
+///
+/// # Known gap (⛔ NOT fixed here)
+///
+/// A cwd that is in **no repo at all** is not "foreign": `paths_are_foreign`
+/// fails closed to `false` when `resolve_commondir` returns `None`, so a bound
+/// agent's non-read subcommand in a non-repo directory is STILL `ChdirPass`.
+/// #3142 covers only the read-only set there. Closing that changes behavior
+/// agents rely on daily (a bare `git status` in a workspace directory currently
+/// reports the worktree), so it is an operator ruling, not a bug fix.
+pub(crate) fn apply_foreign_bare_catchall(action: Action, foreign_bare: bool) -> Action {
+    if foreign_bare && matches!(action, Action::ChdirPass(_)) {
+        Action::Passthrough
+    } else {
+        action
+    }
+}
+
+/// #3379: the WHOLE routing decision — `classify_argv` plus every post-processing
+/// layer — as one pure function of (argv, binding, cwd facts).
+///
+/// Extracted so the shim's real decision chain has exactly ONE definition. It
+/// previously lived inline in `lib.rs`; a test that wanted to assert on the
+/// end-to-end verdict had to restate the chain, which makes the test a copy that
+/// can agree with itself while the shim does something else. The layer ordering
+/// (enumerated foreign rescue → non-repo read rescue → bare catch-all) is the
+/// contract here, not an implementation detail of the caller.
+///
+/// The cwd facts are parameters rather than probed inside, so the matrix stays
+/// hermetically testable without touching the process cwd.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn resolve_action(
+    args: &[String],
+    binding: &Binding,
+    parent_is_gh: bool,
+    canonical_cwd: bool,
+    is_agent_caller: bool,
+    cwd_foreign: bool,
+    cwd_nonrepo: bool,
+) -> Action {
+    let sub_idx = subcommand_index(args);
+    let subcommand = sub_idx
+        .and_then(|i| args.get(i))
+        .map(|s| s.as_str())
+        .unwrap_or("");
+    let norm_args: &[String] = match sub_idx {
+        Some(i) => &args[i..],
+        None => args,
+    };
+    // The cwd-based foreign check only describes where git will act when the
+    // caller has NOT aimed it elsewhere with a leading target override.
+    let foreign_bare =
+        cwd_foreign && !has_leading_target_override(args, sub_idx.unwrap_or(args.len()));
+
+    apply_foreign_bare_catchall(
+        apply_nonrepo_read_passthrough(
+            apply_foreign_repo_passthrough(
+                classify_argv(args, binding, parent_is_gh, canonical_cwd, is_agent_caller),
+                subcommand,
+                norm_args,
+                cwd_foreign,
+            ),
+            subcommand,
+            cwd_nonrepo,
+        ),
+        foreign_bare,
+    )
+}
+
 pub(crate) fn strip_target_overrides(args: &[String]) -> Vec<String> {
     let sub_idx = match subcommand_index(args) {
         Some(i) if is_mutating_local(args[i].as_str()) => {
@@ -509,12 +649,12 @@ pub(crate) fn strip_target_overrides(args: &[String]) -> Vec<String> {
     while i < sub_idx {
         let a = args[i].as_str();
         // Separated-value target overrides → drop the option AND its value.
-        if a == "-C" || a == "--git-dir" || a == "--work-tree" {
+        if is_separated_target_override(a) {
             i += 2;
             continue;
         }
         // Glued / `=` target overrides → drop the single token.
-        if a.starts_with("-C") || a.starts_with("--git-dir=") || a.starts_with("--work-tree=") {
+        if is_glued_target_override(a) {
             i += 1;
             continue;
         }

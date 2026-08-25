@@ -2319,7 +2319,17 @@ fn foreign_passthrough_action_matrix_1463() {
         apply_foreign_repo_passthrough(ChdirPass("wt".into()), "commit", &a(&["commit"]), false),
         ChdirPass("wt".into())
     );
-    // push / checkout are NOT local-mutating → stay ChdirPass even if foreign
+    // push / checkout are NOT local-mutating → THIS converter leaves them alone.
+    //
+    // ⚠ #3379: that is a statement about this function ONLY, no longer about the
+    // shim. For `checkout` it was read as the system-level contract, and it was
+    // wrong: a bound agent's `git checkout -b X` in an unrelated foreign repo
+    // reached `ChdirPass` and moved the BOUND WORKTREE's HEAD to `X` (measured;
+    // the agent's next commit landed on `X` with nothing failing). The system
+    // now converts it one layer later, in `apply_foreign_bare_catchall` — see
+    // `foreign_bare_catchall_covers_classify_default_arm_3379`. Keep these two
+    // rows: they pin that the fix went into the NEW layer and this enumerated
+    // one is byte-identical to before.
     assert_eq!(
         apply_foreign_repo_passthrough(ChdirPass("wt".into()), "push", &a(&["push"]), true),
         ChdirPass("wt".into())
@@ -2337,6 +2347,224 @@ fn foreign_passthrough_action_matrix_1463() {
         apply_foreign_repo_passthrough(Passthrough, "commit", &a(&["commit"]), true),
         Passthrough
     );
+}
+
+// #3379: the foreign-cwd catch-all for the bare form.
+//
+// THE INCIDENT THIS MUST PREVENT (2026-08-25, measured, with a real-git negative
+// control): an agent bound to `fix/lele-image-upload-dispatch-duplicate` ran
+// `pytest`. A test built a scratch repo under `%TEMP%` and ran, with `cwd` set to
+// that scratch dir, `git checkout -b feat/test-branch` then `git checkout -b
+// feat/x`. Both landed on the BOUND WORKTREE — its reflog shows
+// `checkout: moving from fix/lele-image-upload-dispatch-duplicate to
+// feat/test-branch` — and the agent's next commit went onto `feat/x`. No command
+// failed. The same run against `C:\Program Files\Git\cmd\git.exe` left the
+// worktree untouched, so the shim was the only variable.
+#[test]
+fn foreign_bare_catchall_covers_classify_default_arm_3379() {
+    use Action::*;
+    let wt = || ChdirPass("wt".into());
+
+    // ── The incident shape itself ──
+    assert_eq!(
+        apply_foreign_bare_catchall(wt(), true),
+        Passthrough,
+        "`git checkout -b feat/test-branch` with cwd in a foreign scratch repo \
+         must act on THAT repo — this is the exact op that moved the bound \
+         worktree off `fix/lele-image-upload-dispatch-duplicate`"
+    );
+
+    // ── NEGATIVE CONTROL 1: the seatbelt must still do its job ──
+    // A bound agent in its OWN worktree keeps being routed there. If this ever
+    // goes green while the row above is also green for the wrong reason, the fix
+    // has degenerated into "never take over", which breaks every bound agent.
+    assert_eq!(
+        apply_foreign_bare_catchall(wt(), false),
+        wt(),
+        "non-foreign cwd MUST stay ChdirPass — the shim exists to do this"
+    );
+
+    // ── NEGATIVE CONTROL 2: non-ChdirPass verdicts are untouched ──
+    // Deny in particular: a foreign submodule write still denies, so this layer
+    // demonstrably did not dismantle a neighbouring guard.
+    assert_eq!(
+        apply_foreign_bare_catchall(Deny("submodule writes".into()), true),
+        Deny("submodule writes".into()),
+        "Deny must survive the catch-all"
+    );
+    assert_eq!(apply_foreign_bare_catchall(Passthrough, true), Passthrough);
+    assert_eq!(
+        apply_foreign_bare_catchall(SilentExempt { target_branch: "main".into(), reason: "gh".into() }, true),
+        SilentExempt { target_branch: "main".into(), reason: "gh".into() }
+    );
+
+    // ── NEGATIVE CONTROL 3: the push path is out of reach by construction ──
+    // `push` classifies to CleanupAndChdirPushPass, never ChdirPass, so the
+    // protected-ref / force-lease / trust-root guards cannot be routed around by
+    // cd'ing into a foreign repo first.
+    assert_eq!(
+        apply_foreign_bare_catchall(CleanupAndChdirPushPass("wt".into()), true),
+        CleanupAndChdirPushPass("wt".into()),
+        "push must keep its own action — its guards live on that path"
+    );
+}
+
+// #3379: THE INVARIANT, asserted on the shim's real decision chain
+// (`resolve_action` — the same function `lib.rs` calls, not a restatement of it).
+//
+// The rule is not "checkout is also passed through now". It is: **while the
+// caller's cwd is a different object store, NOTHING routes to the bound
+// worktree.** Stated that way it covers the subcommands nobody has thought of
+// yet — which is the whole reason the enumerated version kept missing them.
+#[test]
+fn nothing_reaches_bound_worktree_from_foreign_cwd_3379() {
+    let s = |toks: &[&str]| toks.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+    let b = bound_binding("fix/lele-image-upload-dispatch-duplicate", "/wt");
+
+    // Spread across every classify arm that can yield ChdirPass, so this is a
+    // sample of the whole population and not just the reported symptom:
+    //   checkout/switch arm · flag-discriminated arm · mutating arm ·
+    //   read-only arm · and the `_` default arm (gc/notes/bisect/clean), which
+    //   is the OPEN half — any future subcommand lands there too.
+    let population = [
+        vec!["checkout", "-b", "feat/test-branch"], // the measured incident
+        vec!["switch", "-c", "feat/x"],
+        vec!["clean", "-fdx"], // would WIPE the bound worktree
+        vec!["restore", "--staged", "."],
+        vec!["update-ref", "refs/heads/x", "HEAD"],
+        vec!["symbolic-ref", "HEAD", "refs/heads/x"],
+        vec!["gc", "--prune=now"],
+        vec!["notes", "add", "-m", "x"],
+        vec!["bisect", "start"],
+        vec!["stash", "push"],
+        vec!["commit", "-m", "x"],
+        vec!["status"],
+    ];
+
+    for argv in &population {
+        let args = s(argv);
+        let action = resolve_action(&args, &b, false, false, true, true, false);
+        assert!(
+            !matches!(action, Action::ChdirPass(_)),
+            "`git {}` with cwd in a FOREIGN repo must not be routed to the bound \
+             worktree, got {action:?}",
+            argv.join(" ")
+        );
+    }
+
+    // ── NEGATIVE CONTROL: the same population, cwd NOT foreign ──
+    // Every one of them must still route to the bound worktree. Without this row
+    // the test above is also satisfied by a shim that never takes over anything,
+    // which would break every bound agent while looking fixed.
+    for argv in &population {
+        let args = s(argv);
+        let action = resolve_action(&args, &b, false, false, true, false, false);
+        assert!(
+            matches!(action, Action::ChdirPass(_)),
+            "`git {}` in the agent's OWN worktree must still ChdirPass — the shim \
+             exists to do this, got {action:?}",
+            argv.join(" ")
+        );
+    }
+
+    // ── NEGATIVE CONTROL: a leading target override keeps its existing policy ──
+    // cwd is foreign, but `-C` says git will act somewhere else entirely, so the
+    // cwd-based foreign finding does not speak for this call (#2950 precedent).
+    let args = s(&["-C", "/somewhere/else", "checkout", "-b", "x"]);
+    assert!(
+        matches!(
+            resolve_action(&args, &b, false, false, true, true, false),
+            Action::ChdirPass(_)
+        ),
+        "`git -C <dir> checkout` must keep its pre-#3379 routing"
+    );
+}
+
+// #3379: `bare_form` is what makes the cwd-based foreign check a truthful
+// account of where git will act. With a leading target override it is not, and
+// `Passthrough` would let that override carry the write anywhere — canonical
+// included (the hazard #2950 documented). Those stay on their existing policy.
+#[test]
+fn leading_target_override_detection_3379() {
+    let s = |toks: &[&str]| toks.iter().map(|t| t.to_string()).collect::<Vec<_>>();
+
+    // Separated, glued, and `=` forms all count.
+    for argv in [
+        vec!["-C", "/tmp/x", "checkout"],
+        vec!["-C/tmp/x", "checkout"],
+        vec!["--git-dir", "/g", "checkout"],
+        vec!["--git-dir=/g", "checkout"],
+        vec!["--work-tree", "/w", "checkout"],
+        vec!["--work-tree=/w", "checkout"],
+        vec!["-c", "k=v", "-C", "/x", "checkout"],
+    ] {
+        let args = s(&argv);
+        let idx = subcommand_index(&args).expect("has a subcommand");
+        assert!(
+            has_leading_target_override(&args, idx),
+            "{argv:?} aims git elsewhere — must NOT be treated as the bare form"
+        );
+    }
+
+    // No override → bare form.
+    for argv in [
+        vec!["checkout", "-b", "feat/test-branch"],
+        vec!["clean", "-fdx"],
+        vec!["-c", "k=v", "checkout"],
+        vec!["--no-pager", "checkout"],
+    ] {
+        let args = s(&argv);
+        let idx = subcommand_index(&args).expect("has a subcommand");
+        assert!(
+            !has_leading_target_override(&args, idx),
+            "{argv:?} is cwd-targeted — the foreign check speaks for it"
+        );
+    }
+
+    // A POST-subcommand `-C` is not a target override: `git commit -C <commit>`
+    // is reuse-message. Scanning the whole argv instead of `[0, sub_idx)` would
+    // silently exempt every such call from the fix.
+    let args = s(&["commit", "-C", "HEAD~1"]);
+    let idx = subcommand_index(&args).expect("has a subcommand");
+    assert!(
+        !has_leading_target_override(&args, idx),
+        "`git commit -C <commit>` is reuse-message, not a target override"
+    );
+
+    // Globals-only argv (no subcommand): callers pass `args.len()`; must not panic.
+    let args = s(&["--version"]);
+    assert!(!has_leading_target_override(&args, args.len()));
+    assert!(!has_leading_target_override(&args, 99), "out-of-range sub_idx is clamped");
+}
+
+// #3379: the two target-override token sets are ONE set. `strip_target_overrides`
+// drops these tokens; `has_leading_target_override` detects them. If they were
+// two hand-copied lists, adding a form to one and not the other would drift with
+// nothing turning red — so pin that every token either function recognizes, the
+// other recognizes too.
+#[test]
+fn target_override_token_sets_agree_3379() {
+    for tok in [
+        "-C", "--git-dir", "--work-tree", "-C/tmp/x", "--git-dir=/g", "--work-tree=/w",
+    ] {
+        assert!(
+            is_separated_target_override(tok) || is_glued_target_override(tok),
+            "{tok} must be recognized as a target override"
+        );
+        let args = vec![tok.to_string(), "/v".to_string(), "checkout".to_string()];
+        let idx = subcommand_index(&args).expect("has a subcommand");
+        assert!(
+            has_leading_target_override(&args, idx),
+            "{tok} must make `has_leading_target_override` fire"
+        );
+    }
+    // Non-overrides stay out of both.
+    for tok in ["-c", "--namespace", "--exec-path", "--no-pager", "-p"] {
+        assert!(
+            !is_separated_target_override(tok) && !is_glued_target_override(tok),
+            "{tok} is not a target override"
+        );
+    }
 }
 
 // Sparse-pollution root fix: `sparse-checkout` in a FOREIGN repo must flip
