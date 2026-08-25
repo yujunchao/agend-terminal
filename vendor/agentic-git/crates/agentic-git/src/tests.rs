@@ -2367,11 +2367,19 @@ fn foreign_bare_catchall_covers_classify_default_arm_3379() {
 
     // ── The incident shape itself ──
     assert_eq!(
-        apply_foreign_bare_catchall(wt(), true),
+        apply_foreign_bare_catchall(wt(), "checkout", true),
         Passthrough,
         "`git checkout -b feat/test-branch` with cwd in a foreign scratch repo \
          must act on THAT repo — this is the exact op that moved the bound \
          worktree off `fix/lele-image-upload-dispatch-duplicate`"
+    );
+
+    // An unknown subcommand is state-changing until proven otherwise — that is
+    // the open half of the set, and the safe direction for it.
+    assert_eq!(
+        apply_foreign_bare_catchall(wt(), "some-future-subcommand", true),
+        Passthrough,
+        "an unclassified subcommand must not be assumed read-only"
     );
 
     // ── NEGATIVE CONTROL 1: the seatbelt must still do its job ──
@@ -2379,31 +2387,45 @@ fn foreign_bare_catchall_covers_classify_default_arm_3379() {
     // goes green while the row above is also green for the wrong reason, the fix
     // has degenerated into "never take over", which breaks every bound agent.
     assert_eq!(
-        apply_foreign_bare_catchall(wt(), false),
+        apply_foreign_bare_catchall(wt(), "checkout", false),
         wt(),
         "non-foreign cwd MUST stay ChdirPass — the shim exists to do this"
     );
 
-    // ── NEGATIVE CONTROL 2: non-ChdirPass verdicts are untouched ──
+    // ── NEGATIVE CONTROL 2: reads are out of scope (#2234 ruling) ──
+    assert_eq!(
+        apply_foreign_bare_catchall(wt(), "status", true),
+        wt(),
+        "reads keep reporting the bound worktree — a read cannot damage it"
+    );
+
+    // ── NEGATIVE CONTROL 3: non-ChdirPass verdicts are untouched ──
     // Deny in particular: a foreign submodule write still denies, so this layer
     // demonstrably did not dismantle a neighbouring guard.
     assert_eq!(
-        apply_foreign_bare_catchall(Deny("submodule writes".into()), true),
+        apply_foreign_bare_catchall(Deny("submodule writes".into()), "submodule", true),
         Deny("submodule writes".into()),
         "Deny must survive the catch-all"
     );
-    assert_eq!(apply_foreign_bare_catchall(Passthrough, true), Passthrough);
     assert_eq!(
-        apply_foreign_bare_catchall(SilentExempt { target_branch: "main".into(), reason: "gh".into() }, true),
+        apply_foreign_bare_catchall(Passthrough, "checkout", true),
+        Passthrough
+    );
+    assert_eq!(
+        apply_foreign_bare_catchall(
+            SilentExempt { target_branch: "main".into(), reason: "gh".into() },
+            "checkout",
+            true
+        ),
         SilentExempt { target_branch: "main".into(), reason: "gh".into() }
     );
 
-    // ── NEGATIVE CONTROL 3: the push path is out of reach by construction ──
+    // ── NEGATIVE CONTROL 4: the push path is out of reach by construction ──
     // `push` classifies to CleanupAndChdirPushPass, never ChdirPass, so the
     // protected-ref / force-lease / trust-root guards cannot be routed around by
     // cd'ing into a foreign repo first.
     assert_eq!(
-        apply_foreign_bare_catchall(CleanupAndChdirPushPass("wt".into()), true),
+        apply_foreign_bare_catchall(CleanupAndChdirPushPass("wt".into()), "push", true),
         CleanupAndChdirPushPass("wt".into()),
         "push must keep its own action — its guards live on that path"
     );
@@ -2438,7 +2460,6 @@ fn nothing_reaches_bound_worktree_from_foreign_cwd_3379() {
         vec!["bisect", "start"],
         vec!["stash", "push"],
         vec!["commit", "-m", "x"],
-        vec!["status"],
     ];
 
     for argv in &population {
@@ -2478,6 +2499,37 @@ fn nothing_reaches_bound_worktree_from_foreign_cwd_3379() {
         ),
         "`git -C <dir> checkout` must keep its pre-#3379 routing"
     );
+
+    // ── NEGATIVE CONTROL: READS are deliberately left alone (#2234 ruling) ──
+    // A bound agent's cwd is very often its `<home>/workspace/<agent>` clone,
+    // which IS a foreign object store. Converting reads would silently change
+    // what `git status` reports for essentially every bound agent — #2234 looked
+    // at exactly that and ruled warn-only, NEVER block. A read cannot damage the
+    // worktree, so it is outside what this fix is for.
+    //
+    // This row is here because the first end-to-end probe of the fix DID convert
+    // them: `rev-parse` run from the workspace dir returned that clone's branch
+    // (`master`) instead of the bound branch. The unit tests were all green at
+    // the time — only the live run showed the fix had reached past its scope.
+    for argv in [
+        vec!["status"],
+        vec!["log", "--oneline"],
+        vec!["diff"],
+        vec!["rev-parse", "--abbrev-ref", "HEAD"],
+        vec!["show", "HEAD"],
+        vec!["reflog"],
+    ] {
+        let args = s(&argv);
+        assert!(
+            matches!(
+                resolve_action(&args, &b, false, false, true, true, false),
+                Action::ChdirPass(_)
+            ),
+            "`git {}` must keep reporting the bound worktree from a foreign cwd \
+             (#2234 ruling), got a converted action",
+            argv.join(" ")
+        );
+    }
 }
 
 // #3379: `bare_form` is what makes the cwd-based foreign check a truthful

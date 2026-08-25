@@ -382,31 +382,45 @@ pub(crate) fn apply_nonrepo_read_passthrough(
     subcmd: &str,
     cwd_nonrepo: bool,
 ) -> Action {
-    if cwd_nonrepo
-        && matches!(action, Action::ChdirPass(_))
-        && matches!(
-            subcmd,
-            "status"
-                | "log"
-                | "diff"
-                | "show"
-                | "blame"
-                | "ls-files"
-                | "ls-tree"
-                | "rev-parse"
-                | "fetch"
-                | "remote"
-                | "branch"
-                | "tag"
-                | "describe"
-                | "shortlog"
-                | "reflog"
-        )
-    {
+    if cwd_nonrepo && matches!(action, Action::ChdirPass(_)) && is_read_only_subcommand(subcmd) {
         Action::Passthrough
     } else {
         action
     }
+}
+
+/// The read-only subcommand set — `classify`'s read-only group.
+///
+/// #3379: extracted from `apply_nonrepo_read_passthrough` so
+/// `apply_foreign_bare_catchall` can EXCLUDE the same set instead of keeping a
+/// second copy of it. An unknown subcommand is deliberately NOT read-only: a
+/// caller that reaches the catch-all with something nobody classified must be
+/// assumed to change state, which is the safe direction there.
+///
+/// ⚠ `fetch` / `remote` / `branch` / `tag` write refs in some forms and are in
+/// this set anyway — that is inherited from #3142, not introduced here. The
+/// ref-naming `branch`/`tag` forms are already converted one layer earlier by
+/// `apply_foreign_repo_passthrough` (#2027), so they never reach the catch-all
+/// as ChdirPass in a foreign cwd.
+pub(crate) fn is_read_only_subcommand(subcmd: &str) -> bool {
+    matches!(
+        subcmd,
+        "status"
+            | "log"
+            | "diff"
+            | "show"
+            | "blame"
+            | "ls-files"
+            | "ls-tree"
+            | "rev-parse"
+            | "fetch"
+            | "remote"
+            | "branch"
+            | "tag"
+            | "describe"
+            | "shortlog"
+            | "reflog"
+    )
 }
 
 /// #1463: index of the real subcommand in `args` — the first non-option token,
@@ -565,16 +579,30 @@ pub(crate) fn has_leading_target_override(args: &[String], sub_idx: usize) -> bo
 /// - **A non-foreign cwd is untouched** — a bound agent working in its own
 ///   worktree keeps being routed there, byte-identically.
 ///
+/// - **Read-only commands keep their existing routing.** This is the #2234
+///   operator ruling, and it is load-bearing: a bound agent's cwd is very often
+///   its `<home>/workspace/<agent>` clone, which IS a foreign object store, so
+///   converting reads here would silently change what `git status` / `log` /
+///   `rev-parse` report for essentially every bound agent. #2234 examined
+///   exactly that situation and ruled warn-only, NEVER block. Reads cannot
+///   damage the worktree, so they are outside what this fix is for.
+///
+///   An UNKNOWN subcommand is treated as state-changing, not read-only — the
+///   safe direction for the open half of the set.
+///
 /// # Known gap (⛔ NOT fixed here)
 ///
 /// A cwd that is in **no repo at all** is not "foreign": `paths_are_foreign`
 /// fails closed to `false` when `resolve_commondir` returns `None`, so a bound
 /// agent's non-read subcommand in a non-repo directory is STILL `ChdirPass`.
 /// #3142 covers only the read-only set there. Closing that changes behavior
-/// agents rely on daily (a bare `git status` in a workspace directory currently
-/// reports the worktree), so it is an operator ruling, not a bug fix.
-pub(crate) fn apply_foreign_bare_catchall(action: Action, foreign_bare: bool) -> Action {
-    if foreign_bare && matches!(action, Action::ChdirPass(_)) {
+/// agents rely on daily, so it is an operator ruling, not a bug fix.
+pub(crate) fn apply_foreign_bare_catchall(
+    action: Action,
+    subcmd: &str,
+    foreign_bare: bool,
+) -> Action {
+    if foreign_bare && matches!(action, Action::ChdirPass(_)) && !is_read_only_subcommand(subcmd) {
         Action::Passthrough
     } else {
         action
@@ -628,6 +656,7 @@ pub(crate) fn resolve_action(
             subcommand,
             cwd_nonrepo,
         ),
+        subcommand,
         foreign_bare,
     )
 }
